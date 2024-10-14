@@ -1,43 +1,11 @@
 import torch
 import gpytorch
 
-class UncertaintyCovariance(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, x1, x2, var1, var2, lengthscale, dist_func):
-        if any(ctx.needs_input_grad[:2]):
-            raise RuntimeError("LaplacianCovariance cannot compute gradients with " "respect to x1 and x2")
-        if lengthscale.size(-1) > 1:
-            raise ValueError("LaplacianCovariance cannot handle multiple lengthscales")
-        needs_grad = any(ctx.needs_input_grad)
-
-        var_dist = dist_func(var1, -var2)
-        mean_dist = dist_func(x1, x2)
-
-        l2 = lengthscale * lengthscale
-
-        temp = mean_dist / (l2+var_dist)
-        temp2 = 1.0+var_dist/l2
-
-        covar_mat = torch.pow(temp2, -0.5)*torch.exp(-0.5*temp)
-
-        if needs_grad:
-            d_output_d_input = mean_dist.mul_(covar_mat).div_(lengthscale)
-            ctx.save_for_backward(d_output_d_input)
-
-        return covar_mat
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        d_output_d_input = ctx.saved_tensors[0]
-        lengthscale_grad = grad_output * d_output_d_input
-        return None, None, None, None, lengthscale_grad, None
-
-
 class UncertainKernel(gpytorch.kernels.Kernel):
 
     has_lengthscale = True
 
-    def forward(self, x1, x2, diag, **params):
+    def forward(self, x1, x2, **params):
 
         # preprocessing
         x1_mean = torch.unsqueeze(x1[:,0], 1)
@@ -46,15 +14,52 @@ class UncertainKernel(gpytorch.kernels.Kernel):
         x2_mean = torch.unsqueeze(x2[:,0], 1)
         x2_var = torch.unsqueeze(x2[:,1], 1)
 
-        self.ard_num_dims = len(x1_mean[0]) # always has to have ard_num_dims as specified in paper
+        if len(x1_mean.shape)>2:
+            x1_mean = torch.squeeze(x1_mean)
+            x1_var = torch.squeeze(x1_var)
 
-        return UncertaintyCovariance.apply(
-            x1_mean,
-            x2_mean,
-            x1_var,
-            x2_var,
-            self.lengthscale,
-            lambda x1_mean, x2_mean: self.covar_dist(
-                x1_mean, x2_mean, square_dist=True, diag=diag, postprocess=False, **params
-            ),
-        )
+            x2_mean = torch.squeeze(x2_mean)
+            x2_var = torch.squeeze(x2_var)
+
+        l2 = self.lengthscale * self.lengthscale
+
+
+        """
+        Numerator Only
+        """
+
+        # print(x1_var.shape)
+        # print(x2_var.shape)
+        # print(self.lengthscale.shape)
+        var_dist = self.lengthscale + x1_var + x2_var#self.covar_dist(x1_var, -x2_var, square_dist=False)
+
+        # print(var_dist.shape)
+
+        # temp = self.lengthscale + var_dist
+
+        x1_mean_ = x1_mean.div(var_dist)
+        x2_mean_ = x2_mean.div(var_dist)
+
+        temp2 = self.covar_dist(x1_mean_, x2_mean_, square_dist=True)
+
+        dist_mat = temp2.div_(-2).exp_()
+
+        return dist_mat
+
+
+        """
+        Denominator Only
+        """
+
+        x1_var_ = x1_var.div(self.lengthscale)
+        x2_var_ = x2_var.div(self.lengthscale)
+
+        denomDist = self.covar_dist(x1_var_, x2_var_, square_dist=False)
+        denomDist = denomDist.abs().sqrt()
+
+
+        """
+        Combined
+        """
+
+        return dist_mat.div(denomDist)
