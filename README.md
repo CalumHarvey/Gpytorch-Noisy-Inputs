@@ -1,4 +1,4 @@
-# Gpytorch-Noisy-Inputs
+# GPyTorch-Noisy-Inputs
 
 Gpytorch kernel implementing the approach shown in Dallaire et al "Learning Gaussian Process Models from Uncertain Data".
 
