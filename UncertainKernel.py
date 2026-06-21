@@ -1,65 +1,60 @@
 import torch
 import gpytorch
 
+
 class UncertainKernel(gpytorch.kernels.Kernel):
+    r"""
+    RBF style kernel for one dimensional inputs whose locations are only
+    known up to a Gaussian uncertainty.
+
+    Implements the covariance function from Dallaire, Besse and Chaib draa,
+    "Learning Gaussian Process Models from Uncertain Data" (ICONIP 2009),
+    which marginalizes the input noise out of a standard RBF kernel in
+    closed form.
+
+    Each input point is encoded as a 2 column tensor, not a single value:
+
+        x[..., 0] = mean of the input location
+        x[..., 1] = variance of the input location (0 for an exactly known point)
+
+    For two points x_i = (mu_i, s_i^2) and x_j = (mu_j, s_j^2), with
+    lengthscale l, the kernel is:
+
+        norm_ij = l^2 + s_i^2 + s_j^2
+        k(x_i, x_j) = sqrt(l^2 / norm_ij) * exp(-0.5 * (mu_i - mu_j)^2 / norm_ij)
+
+    When s_i = s_j = 0 this reduces exactly to a standard RBF kernel. Larger
+    input variance on either point widens norm_ij, which both flattens the
+    exponential term and shrinks the sqrt prefactor, so uncertain points
+    contribute weaker covariance than precisely known ones.
+
+    Wrap this kernel in gpytorch.kernels.ScaleKernel to add a learned output
+    scale (signal variance), matching the example in kernelTesting.ipynb.
+    """
 
     has_lengthscale = True
 
-    def forward(self, x1, x2, **params):
+    @staticmethod
+    def _split(x):
+        """Split a (..., N, 2) tensor of (mean, variance) pairs into its two columns."""
+        mean = x[..., 0:1]
+        var = x[..., 1:2]
+        return mean, var
 
-        # preprocessing
-        x1_mean = torch.unsqueeze(x1[:,0], 1)
-        x1_var = torch.unsqueeze(x1[:,1], 1)
+    def forward(self, x1, x2, diag=False, **params):
+        x1_mean, x1_var = self._split(x1)
+        x2_mean, x2_var = self._split(x2)
 
-        x2_mean = torch.unsqueeze(x2[:,0], 1)
-        x2_var = torch.unsqueeze(x2[:,1], 1)
+        l2 = self.lengthscale.pow(2)
 
-        if len(x1_mean.shape)>2:
-            x1_mean = torch.squeeze(x1_mean)
-            x1_var = torch.squeeze(x1_var)
+        # Squared distance between means, shape (..., N, M), or (..., N) if diag.
+        sq_dist = self.covar_dist(x1_mean, x2_mean, diag=diag, square_dist=True)
 
-            x2_mean = torch.squeeze(x2_mean)
-            x2_var = torch.squeeze(x2_var)
+        if diag:
+            # x1_var and x2_var are already aligned point for point.
+            norm = (l2 + x1_var + x2_var).squeeze(-1)
+        else:
+            # Pairwise sum: norm[..., i, j] = l^2 + var1[i] + var2[j]
+            norm = l2 + x1_var + x2_var.transpose(-1, -2)
 
-        l2 = self.lengthscale * self.lengthscale
-
-
-        """
-        Numerator Only
-        """
-
-        # print(x1_var.shape)
-        # print(x2_var.shape)
-        # print(self.lengthscale.shape)
-        var_dist = self.lengthscale + x1_var + x2_var#self.covar_dist(x1_var, -x2_var, square_dist=False)
-
-        # print(var_dist.shape)
-
-        # temp = self.lengthscale + var_dist
-
-        x1_mean_ = x1_mean.div(var_dist)
-        x2_mean_ = x2_mean.div(var_dist)
-
-        temp2 = self.covar_dist(x1_mean_, x2_mean_, square_dist=True)
-
-        dist_mat = temp2.div_(-2).exp_()
-
-        return dist_mat
-
-
-        """
-        Denominator Only
-        """
-
-        x1_var_ = x1_var.div(self.lengthscale)
-        x2_var_ = x2_var.div(self.lengthscale)
-
-        denomDist = self.covar_dist(x1_var_, x2_var_, square_dist=False)
-        denomDist = denomDist.abs().sqrt()
-
-
-        """
-        Combined
-        """
-
-        return dist_mat.div(denomDist)
+        return (l2 / norm).sqrt() * torch.exp(-0.5 * sq_dist / norm)
